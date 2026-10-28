@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 import joblib
@@ -8,6 +9,15 @@ import pandas as pd
 from preprocessing import CATEGORICAL_FEATURES, NUMERIC_FEATURES, load_datasets
 
 MODEL_PATH = Path(__file__).parent / "models" / "runwaysafe_model.joblib"
+WEATHER_SEVERITY_VALUES = ("Normal", "Adverse", "Severe")
+WEATHER_SEVERITY_ALIASES = {
+    "Normal": "Normal",
+    "Light": "Normal",
+    "Moderate": "Adverse",
+    "Adverse": "Adverse",
+    "Heavy": "Severe",
+    "Severe": "Severe",
+}
 
 FRIENDLY_NAMES = {
     "rainfall_mm": "Rainfall",
@@ -29,6 +39,7 @@ FRIENDLY_NAMES = {
 }
 
 
+@lru_cache(maxsize=1)
 def load_model_bundle() -> dict:
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(
@@ -37,8 +48,13 @@ def load_model_bundle() -> dict:
     return joblib.load(MODEL_PATH)
 
 
+@lru_cache(maxsize=1)
+def _cached_datasets() -> dict[str, pd.DataFrame]:
+    return load_datasets()
+
+
 def available_contexts(airport_code: str, runway_id: str) -> pd.DataFrame:
-    inspections = load_datasets()["inspections"]
+    inspections = _cached_datasets()["inspections"]
     return (
         inspections[
             (inspections["airport_code"] == airport_code)
@@ -130,6 +146,12 @@ def _clamp(value: float) -> float:
     return max(0.0, min(100.0, value))
 
 
+def _normalize_weather_severity(value: object) -> str | None:
+    if value is None or pd.isna(value):
+        return "Normal"
+    return WEATHER_SEVERITY_ALIASES.get(str(value), str(value))
+
+
 def _risk_components(row: dict) -> dict[str, float]:
     weather = (
         (max(0.0, 10.0 - float(row["visibility_km"])) * 4.0)
@@ -215,10 +237,18 @@ def recommendations(row: dict) -> list[str]:
     return actions or ["Continue routine monitoring and scheduled runway inspections."]
 
 
-def predict_context(airport_code: str, runway_id: str, timestamp: pd.Timestamp) -> dict:
-    row, supporting = _context_row(load_datasets(), airport_code, runway_id, timestamp)
+def predict_row(
+    row: dict,
+    timestamp: pd.Timestamp,
+    supporting: dict[str, object] | None = None,
+) -> dict:
+    """Calculate AIRS-RAN and ML results for a complete feature row."""
+    normalized_row = row.copy()
+    normalized_row["weather_severity"] = _normalize_weather_severity(
+        row.get("weather_severity")
+    )
     bundle = load_model_bundle()
-    features = pd.DataFrame([row])[NUMERIC_FEATURES + CATEGORICAL_FEATURES]
+    features = pd.DataFrame([normalized_row])[NUMERIC_FEATURES + CATEGORICAL_FEATURES]
     model = bundle["model"]
     probabilities = model.predict_proba(features)[0]
     predicted = int(model.predict(features)[0])
@@ -229,8 +259,8 @@ def predict_context(airport_code: str, runway_id: str, timestamp: pd.Timestamp) 
         {"feature": names, "importance": classifier.feature_importances_, "value": transformed[0]}
     )
     contributions["contribution"] = contributions["importance"] * contributions["value"].abs()
-    components = _risk_components(row)
-    score, weights = _airs_ran(components, row)
+    components = _risk_components(normalized_row)
+    score, weights = _airs_ran(components, normalized_row)
     level = "High" if score >= 65 else "Medium" if score >= 35 else "Low"
     return {
         "prediction": predicted,
@@ -241,15 +271,22 @@ def predict_context(airport_code: str, runway_id: str, timestamp: pd.Timestamp) 
         },
         "confidence": float(probabilities[predicted]),
         "timestamp": timestamp,
-        "row": row,
-        "supporting": supporting,
+        "row": normalized_row,
+        "supporting": supporting or {},
         "risk_score": score,
         "risk_level": level,
         "components": components,
         "weights": weights,
-        "top_factors": _factor_explanations(row, components),
-        "recommendations": recommendations(row),
+        "top_factors": _factor_explanations(normalized_row, components),
+        "recommendations": recommendations(normalized_row),
     }
+
+
+def predict_context(airport_code: str, runway_id: str, timestamp: pd.Timestamp) -> dict:
+    row, supporting = _context_row(
+        _cached_datasets(), airport_code, runway_id, timestamp
+    )
+    return predict_row(row, timestamp, supporting)
 
 
 def latest_prediction(airport_code: str, runway_id: str) -> dict:

@@ -13,6 +13,8 @@ from prediction import (
     latest_prediction,
     load_model_bundle,
     predict_context,
+    predict_row,
+    WEATHER_SEVERITY_VALUES,
 )
 from preprocessing import load_datasets
 
@@ -123,7 +125,7 @@ def condition_table(result: dict) -> pd.DataFrame:
                 str(row["prior_incident_count"]),
             ],
         }
-    ).set_index("Condition")
+    ).assign(Value=lambda frame: frame["Value"].astype(str)).set_index("Condition")
 
 
 def latest_assessments(inspections: pd.DataFrame) -> tuple[list[dict], list[str]]:
@@ -162,6 +164,140 @@ def alerts_for(result: dict) -> list[dict[str, str]]:
     return alerts
 
 
+def manual_assessment_form(
+    baseline: dict,
+) -> dict | None:
+    row = baseline["row"]
+    st.caption(
+        "Enter the conditions you want to assess. Values are pre-filled from the "
+        "selected inspection context and can be changed for a what-if scenario."
+    )
+    with st.form("manual_risk_calculator"):
+        st.markdown("#### Weather conditions")
+        weather_columns = st.columns(4)
+        rainfall = weather_columns[0].number_input(
+            "Rainfall (mm)", min_value=0.0, max_value=500.0,
+            value=float(row["rainfall_mm"]), step=0.5,
+            help="How much rain has fallen. More rain can add water and reduce safe runway performance, so higher values increase risk.",
+        )
+        wind_speed = weather_columns[1].number_input(
+            "Wind speed (m/s)", min_value=0.0, max_value=100.0,
+            value=float(row["wind_speed_mps"]), step=0.5,
+            help="The speed of the wind near the runway. Stronger wind can make aircraft control harder, so higher values increase risk.",
+        )
+        visibility = weather_columns[2].number_input(
+            "Visibility (km)", min_value=0.0, max_value=100.0,
+            value=float(row["visibility_km"]), step=0.5,
+            help="How far pilots can see. Shorter visibility makes landing and runway movement harder, so lower values increase risk.",
+        )
+        weather_severity = weather_columns[3].selectbox(
+            "Weather severity", WEATHER_SEVERITY_VALUES,
+            index=(
+                WEATHER_SEVERITY_VALUES.index(row["weather_severity"])
+                if row["weather_severity"] in WEATHER_SEVERITY_VALUES
+                else 0
+            ),
+            help="A simple description of the overall weather. Adverse or Severe weather adds more weather risk than Normal.",
+        )
+
+        st.markdown("#### Runway surface")
+        runway_columns = st.columns(4)
+        water = runway_columns[0].number_input(
+            "Surface water (mm)", min_value=0.0, max_value=100.0,
+            value=float(row["water_accumulation_mm"]), step=0.5,
+            help="The depth of water standing on the runway. More water can cause skidding or hydroplaning, so higher values increase risk.",
+        )
+        debris = runway_columns[1].number_input(
+            "Debris level", min_value=0.0, max_value=10.0,
+            value=float(row["debris_level"]), step=0.5,
+            help="The amount of loose material such as stones or foreign objects. More debris can damage aircraft or reduce control, so higher values increase risk.",
+        )
+        friction = runway_columns[2].number_input(
+            "Friction coefficient", min_value=0.0, max_value=1.0,
+            value=float(row["friction_coefficient"]), step=0.01,
+            help="How much grip the runway surface provides. Less grip means longer stopping distance, so lower values increase risk.",
+        )
+        surface = runway_columns[3].selectbox(
+            "Surface condition", ["Good", "Fair", "Poor"],
+            index=["Good", "Fair", "Poor"].index(
+                row["surface_condition"]
+                if row["surface_condition"] in {"Good", "Fair", "Poor"}
+                else "Good"
+            ),
+            help="A visual assessment of pavement condition. Poor surfaces are more hazardous than Fair or Good surfaces.",
+        )
+
+        st.markdown("#### Operations and lighting")
+        operation_columns = st.columns(4)
+        lighting = operation_columns[0].selectbox(
+            "Lighting status", ["Operational", "Degraded"],
+            index=["Operational", "Degraded"].index(
+                row["lighting_status"]
+                if row["lighting_status"] in {"Operational", "Degraded"}
+                else "Operational"
+            ),
+            help="Whether runway lighting is working normally. Degraded lighting can reduce pilot visibility, so Degraded increases risk.",
+        )
+        traffic = operation_columns[1].number_input(
+            "Traffic density (%)", min_value=0.0, max_value=100.0,
+            value=float(row["traffic_density_mean"]), step=1.0,
+            help="How busy the runway is compared with its operating capacity. More traffic reduces spacing and inspection time, so higher values increase risk.",
+        )
+        arrival_delay = operation_columns[2].number_input(
+            "Average arrival delay (min)", min_value=-120.0, max_value=500.0,
+            value=float(row["arrival_delay_mean"]), step=1.0,
+            help="The average delay for arriving flights. Positive delays indicate schedule pressure, so higher positive values increase operational risk.",
+        )
+        departure_delay = operation_columns[3].number_input(
+            "Average departure delay (min)", min_value=-120.0, max_value=500.0,
+            value=float(row["departure_delay_mean"]), step=1.0,
+            help="The average delay for departing flights. Positive delays indicate schedule pressure, so higher positive values increase operational risk.",
+        )
+
+        st.markdown("#### Flight and incident history")
+        history_columns = st.columns(3)
+        flight_count = history_columns[0].number_input(
+            "Flight operations", min_value=0, max_value=1000,
+            value=int(row["flight_count"]), step=1,
+            help="The number of flights using this runway in the assessment period. More movements increase operational workload, so higher values increase risk.",
+        )
+        prior_incidents = history_columns[1].number_input(
+            "Previous incidents", min_value=0, max_value=1000,
+            value=int(row["prior_incident_count"]), step=1,
+            help="The number of earlier incidents recorded for this runway. A higher history indicates recurring concerns, so higher values increase risk.",
+        )
+        prior_high_risk = history_columns[2].number_input(
+            "Previous high-risk incidents", min_value=0, max_value=1000,
+            value=int(row["prior_high_risk_count"]), step=1,
+            help="The number of earlier incidents classified as High risk. More serious history raises the safety baseline, so higher values increase risk.",
+        )
+        submitted = st.form_submit_button("Calculate risk", type="primary")
+
+    if not submitted:
+        return None
+    manual_row = row.copy()
+    manual_row.update(
+        {
+            "rainfall_mm": rainfall,
+            "wind_speed_mps": wind_speed,
+            "visibility_km": visibility,
+            "weather_severity": weather_severity,
+            "water_accumulation_mm": water,
+            "debris_level": debris,
+            "friction_coefficient": friction,
+            "surface_condition": surface,
+            "lighting_status": lighting,
+            "traffic_density_mean": traffic,
+            "arrival_delay_mean": arrival_delay,
+            "departure_delay_mean": departure_delay,
+            "flight_count": flight_count,
+            "prior_incident_count": prior_incidents,
+            "prior_high_risk_count": min(prior_high_risk, prior_incidents),
+        }
+    )
+    return manual_row
+
+
 try:
     datasets = get_datasets()
 except (FileNotFoundError, OSError, ValueError) as error:
@@ -180,6 +316,7 @@ tabs = st.tabs(
     [
         "Home / Overview",
         "Runway Risk Assessment",
+        "What-if Risk Calculator",
         "Current Conditions",
         "Safety Alerts",
         "Recommendations",
@@ -239,6 +376,25 @@ with tabs[1]:
             st.error(f"Unable to generate prediction: {error}")
 
 with tabs[2]:
+    st.header("What-if Risk Calculator")
+    st.caption(
+        "Use this calculator to test a proposed set of runway, weather, traffic, "
+        "and history inputs. It does not change the stored datasets."
+    )
+    selection = context_controls(datasets, "manual")
+    if selection:
+        airport, runway, timestamp = selection
+        try:
+            baseline = predict_context(airport, runway, timestamp)
+            manual_row = manual_assessment_form(baseline)
+            if manual_row is not None:
+                result = predict_row(manual_row, timestamp)
+                st.subheader("Calculated risk")
+                show_prediction(result)
+        except (FileNotFoundError, OSError, ValueError, KeyError) as error:
+            st.error(f"Unable to calculate the requested scenario: {error}")
+
+with tabs[3]:
     st.header("Current Conditions")
     selection = context_controls(datasets, "conditions")
     if selection:
@@ -261,7 +417,7 @@ with tabs[2]:
         except (FileNotFoundError, OSError, ValueError, KeyError) as error:
             st.error(f"Unable to load current conditions: {error}")
 
-with tabs[3]:
+with tabs[4]:
     st.header("Safety Alerts")
     st.caption("Thresholds are transparent rule-based signals derived from actual selected latest conditions.")
     assessments, errors = latest_assessments(inspections)
@@ -279,7 +435,7 @@ with tabs[3]:
         st.warning("Some alert assessments failed and require review.")
         st.code("\n".join(errors))
 
-with tabs[4]:
+with tabs[5]:
     st.header("Recommendations")
     assessments, _ = latest_assessments(inspections)
     recommendations_rows = []
@@ -299,7 +455,7 @@ with tabs[4]:
     else:
         st.success("No additional recommendations were triggered.")
 
-with tabs[5]:
+with tabs[6]:
     st.header("Risk History")
     history = incidents.copy()
     history["Date"] = history["date"].dt.date
@@ -320,7 +476,7 @@ with tabs[5]:
     st.subheader("Incident risk trend")
     st.line_chart(trend)
 
-with tabs[6]:
+with tabs[7]:
     st.header("Analytics")
     all_airports = sorted(set(weather["airport_code"]) | set(inspections["airport_code"]) | set(flights["airport_code"]) | set(incidents["airport_code"]))
     selected_airports = st.multiselect("Airports", all_airports, default=all_airports, key="analytics_airports")
@@ -351,7 +507,7 @@ with tabs[6]:
     else:
         st.warning("Evaluation results are not available. Run ml_training.py.")
 
-with tabs[7]:
+with tabs[8]:
     st.header("Reports")
     st.caption("Generate a data-backed report for a selected inspection context and export it as CSV.")
     selection = context_controls(datasets, "report")
